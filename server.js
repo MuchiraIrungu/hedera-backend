@@ -1,0 +1,212 @@
+// backend/server.js
+import dotenv from 'dotenv';
+dotenv.config();
+
+import { createRequire } from 'module';
+const require = createRequire(import.meta.url);
+
+import { 
+  Client, 
+  TokenMintTransaction, 
+  TransferTransaction,
+  AccountId,
+  Hbar,
+  PrivateKey,
+  TokenId
+} from '@hashgraph/sdk';
+import express from 'express';
+import cors from 'cors';
+import { createHiveTokenCollection, mintHiveNFT } from './nft.js';
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+//----------//
+//Upload to PINATA code
+async function uploadToPinata(metadata) {
+  try {
+    const response = await fetch("https://api.pinata.cloud/pinning/pinJSONToIPFS", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${process.env.PINATA_JWT}`
+      },
+      body: JSON.stringify({
+        pinataMetadata: { name: `Ecolive Hive #${metadata.attributes[0].value}` },
+        pinataContent: metadata
+      })
+    });
+
+    const data = await response.json();
+
+    if (!data.IpfsHash) throw new Error("Pinata failed");
+
+    const ipfsUrl = `ipfs://${data.IpfsHash}`;
+    console.log("IPFS UPLOAD SUCCESS:", ipfsUrl);
+    return ipfsUrl;
+
+  } catch (err) {
+    console.warn("Pinata failed → using fallback metadata");
+    // Fallback: Use on-chain fallback
+    return `hive:${metadata.attributes.find(a => a.trait_type === "Hive ID").value}`;
+  }
+}
+//----------//
+
+// POST /api/create-token
+app.post('/api/create-token', async (req, res) => {
+  console.log('CREATE-TOKEN REQUEST RECEIVED');
+  try {
+    const result = await createHiveTokenCollection();
+    if (result.success) {
+      res.json({
+        success: true,
+        tokenId: result.tokenId.toString(),
+        supplyKey: result.supplyKey.toString(),
+        adminKey: result.adminKey.toString(),
+        transactionId: result.transactionId
+      });
+    } else {
+      res.json(result)
+    }
+  } catch (err) {
+    console.error('CREATE ERROR:', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// POST /api/mint-nft
+app.post('/api/mint-nft', async (req, res) => {
+  console.log('MINT-NFT REQUEST RECEIVED', req.body);
+  const { tokenId: tokenIdStr, supplyKey: supplyKeyStr, ...hiveMetadata } = req.body;
+
+  if (!tokenIdStr || !supplyKeyStr) {
+    return res.status(400).json({ success: false, error: 'Missing tokenId or supplyKey' });
+  }
+
+  try {
+    console.log('Minting NFT for:', hiveMetadata.name);
+    const tokenId = TokenId.fromString(tokenIdStr);
+    const supplyKey = PrivateKey.fromString(supplyKeyStr);
+
+    const result = await mintHiveNFT(supplyKey, tokenId, hiveMetadata);
+    res.json(result);
+  } catch (err) {
+    console.error('MINT NFT ERROR:', err);
+    res.status(500).json({ success: false, error: err.message || 'Mint failed' });
+  }
+});
+
+// POST /api/buy-hive - CORRECTED VERSION WITH TRANSFER
+app.post('/api/buy-hive', async (req, res) => {
+  const { hiveId, investorAccountId, tokenId: tokenIdStr, supplyKey: supplyKeyStr } = req.body;
+  console.log("BUY REQUEST RECEIVED:", req.body);
+
+  try {
+    // Validate inputs
+    if (!tokenIdStr || !supplyKeyStr || !investorAccountId) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Missing required fields: tokenId, supplyKey, or investorAccountId' 
+      });
+    }
+
+    const tokenId = TokenId.fromString(tokenIdStr);
+    const supplyKey = PrivateKey.fromString(supplyKeyStr);
+    const buyerAccountId = AccountId.fromString(investorAccountId);
+    const treasuryAccountId = AccountId.fromString(process.env.MY_ACCOUNT_ID);
+    const treasuryKey = PrivateKey.fromString(process.env.MY_PRIVATE_KEY);
+
+    // Find mock hive data
+    const HIVES = require('./data/hives.json');
+    const hive = HIVES.find(h => h.id === hiveId);
+    if (!hive) {
+      return res.status(404).json({ 
+        success: false, 
+        error: `Hive with id ${hiveId} not found` 
+      });
+    }
+
+    // Build rich metadata
+    const metadata = {
+      name: hive.name,
+      description: hive.description,
+      image: hive.image,
+      attributes: [
+        { trait_type: "Hive ID", value: hive.id },
+        { trait_type: "Location", value: hive.location },
+        { trait_type: "Farmer", value: hive.farmer },
+        { trait_type: "Investment", value: `${hive.price} HBAR` },
+        { trait_type: "Status", value: "sold" },
+        { trait_type: "Owner", value: investorAccountId }
+      ]
+    };
+
+    // Upload to Pinata (or fallback)
+    const ipfsUrl = await uploadToPinata(metadata);
+    const metadataBytes = Buffer.from(ipfsUrl);
+
+    if (metadataBytes.length > 100) {
+      throw new Error("Metadata too big (max 100 bytes)");
+    }
+
+    // Initialize Hedera client
+    const client = Client.forTestnet().setOperator(
+      process.env.MY_ACCOUNT_ID,
+      process.env.MY_PRIVATE_KEY
+    );
+    client.setDefaultMaxTransactionFee(new Hbar(100));
+
+    // STEP 1: Mint NFT to treasury
+    console.log("Step 1: Minting NFT to treasury...");
+    const mintTx = new TokenMintTransaction()
+      .setTokenId(tokenId)
+      .setMetadata([metadataBytes])
+      .setMaxTransactionFee(new Hbar(30));
+
+    const mintFrozen = await mintTx.freezeWith(client);
+    const mintSigned = await mintFrozen.sign(supplyKey);
+    const mintResponse = await mintSigned.execute(client);
+    const mintReceipt = await mintResponse.getReceipt(client);
+
+    const serial = mintReceipt.serials[0];
+    console.log(`✓ Minted NFT #${serial} to treasury`);
+
+    // STEP 2: Transfer NFT from treasury to buyer
+    console.log(`Step 2: Transferring NFT #${serial} to buyer ${investorAccountId}...`);
+    
+    const transferTx = new TransferTransaction()
+      .addNftTransfer(tokenId, serial, treasuryAccountId, buyerAccountId)
+      .setMaxTransactionFee(new Hbar(30));
+
+    const transferFrozen = await transferTx.freezeWith(client);
+    const transferSigned = await transferFrozen.sign(treasuryKey);
+    const transferResponse = await transferSigned.execute(client);
+    const transferReceipt = await transferResponse.getReceipt(client);
+
+    console.log(`✓ Transfer successful! Status: ${transferReceipt.status.toString()}`);
+
+    res.json({
+      success: true,
+      serialNumber: serial.toString(),
+      tokenId: tokenId.toString(),
+      explorerUrl: `https://hashscan.io/testnet/token/${tokenId}/${serial}`,
+      transactionId: transferResponse.transactionId.toString(),
+      message: "NFT minted and transferred to your wallet!"
+    });
+
+  } catch (err) {
+    console.error("BUY-HIVE ERROR:", err);
+    res.status(500).json({ 
+      success: false, 
+      error: err.message || 'Purchase failed' 
+    });
+  }
+});
+
+const PORT = 3001;
+
+app.listen(PORT, () => {
+  console.log(`SERVER running on port ${PORT}`);
+});
