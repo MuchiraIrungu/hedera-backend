@@ -17,13 +17,38 @@ import {
 import express from 'express';
 import cors from 'cors';
 import { createHiveTokenCollection, mintHiveNFT } from './nft.js';
+import fs from 'fs';
+import path from 'path';
 
 const app = express();
-app.use(cors());
+
+// ✅ PROPER CORS CONFIGURATION
+const allowedOrigins = [
+  'http://localhost:5173',
+  'http://localhost:3000',
+  process.env.FRONTEND_URL || 'https://your-frontend.onrender.com'
+];
+
+app.use(cors({
+  origin: function(origin, callback) {
+    // Allow requests with no origin (mobile apps, Postman, etc)
+    if (!origin) return callback(null, true);
+    
+    if (allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      console.log('Blocked origin:', origin);
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
+  credentials: true
+}));
+
 app.use(express.json());
 
 //----------//
-//Upload to PINATA code
+// Upload to PINATA
+//----------//
 async function uploadToPinata(metadata) {
   try {
     const response = await fetch("https://api.pinata.cloud/pinning/pinJSONToIPFS", {
@@ -48,11 +73,41 @@ async function uploadToPinata(metadata) {
 
   } catch (err) {
     console.warn("Pinata failed → using fallback metadata");
-    // Fallback: Use on-chain fallback
     return `hive:${metadata.attributes.find(a => a.trait_type === "Hive ID").value}`;
   }
 }
+
 //----------//
+// Update hive status after sale
+//----------//
+function markHiveAsSold(hiveId, buyerAccountId, serialNumber) {
+  try {
+    const hivesPath = path.join(process.cwd(), 'data', 'hives.json');
+    const hives = JSON.parse(fs.readFileSync(hivesPath, 'utf8'));
+    
+    const hiveIndex = hives.findIndex(h => h.id === hiveId);
+    if (hiveIndex !== -1) {
+      hives[hiveIndex].status = 'sold';
+      hives[hiveIndex].owner = buyerAccountId;
+      hives[hiveIndex].serialNumber = serialNumber;
+      hives[hiveIndex].soldAt = new Date().toISOString();
+      
+      fs.writeFileSync(hivesPath, JSON.stringify(hives, null, 2));
+      console.log(`✓ Marked hive ${hiveId} as sold`);
+    }
+  } catch (err) {
+    console.error('Failed to update hive status:', err);
+  }
+}
+
+// ✅ HEALTH CHECK ENDPOINT (Required for deployment)
+app.get('/health', (req, res) => {
+  res.json({ 
+    status: 'ok', 
+    timestamp: new Date().toISOString(),
+    environment: process.env.NODE_ENV || 'development'
+  });
+});
 
 // POST /api/create-token
 app.post('/api/create-token', async (req, res) => {
@@ -68,7 +123,7 @@ app.post('/api/create-token', async (req, res) => {
         transactionId: result.transactionId
       });
     } else {
-      res.json(result)
+      res.json(result);
     }
   } catch (err) {
     console.error('CREATE ERROR:', err);
@@ -98,7 +153,7 @@ app.post('/api/mint-nft', async (req, res) => {
   }
 });
 
-// POST /api/buy-hive - CORRECTED VERSION WITH TRANSFER
+// POST /api/buy-hive - Complete purchase flow
 app.post('/api/buy-hive', async (req, res) => {
   const { hiveId, investorAccountId, tokenId: tokenIdStr, supplyKey: supplyKeyStr } = req.body;
   console.log("BUY REQUEST RECEIVED:", req.body);
@@ -118,9 +173,10 @@ app.post('/api/buy-hive', async (req, res) => {
     const treasuryAccountId = AccountId.fromString(process.env.MY_ACCOUNT_ID);
     const treasuryKey = PrivateKey.fromString(process.env.MY_PRIVATE_KEY);
 
-    // Find mock hive data
+    // Find hive data
     const HIVES = require('./data/hives.json');
     const hive = HIVES.find(h => h.id === hiveId);
+    
     if (!hive) {
       return res.status(404).json({ 
         success: false, 
@@ -128,7 +184,15 @@ app.post('/api/buy-hive', async (req, res) => {
       });
     }
 
-    // Build rich metadata
+    // Check if already sold
+    if (hive.status === 'sold') {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'This hive has already been sold' 
+      });
+    }
+
+    // Build metadata
     const metadata = {
       name: hive.name,
       description: hive.description,
@@ -143,7 +207,7 @@ app.post('/api/buy-hive', async (req, res) => {
       ]
     };
 
-    // Upload to Pinata (or fallback)
+    // Upload to IPFS
     const ipfsUrl = await uploadToPinata(metadata);
     const metadataBytes = Buffer.from(ipfsUrl);
 
@@ -187,6 +251,9 @@ app.post('/api/buy-hive', async (req, res) => {
 
     console.log(`✓ Transfer successful! Status: ${transferReceipt.status.toString()}`);
 
+    // Update database
+    markHiveAsSold(hiveId, investorAccountId, serial.toString());
+
     res.json({
       success: true,
       serialNumber: serial.toString(),
@@ -205,8 +272,34 @@ app.post('/api/buy-hive', async (req, res) => {
   }
 });
 
-const PORT = 3001;
+// GET /api/hive-status/:hiveId - Check hive availability
+app.get('/api/hive-status/:hiveId', (req, res) => {
+  try {
+    const { hiveId } = req.params;
+    const HIVES = require('./data/hives.json');
+    const hive = HIVES.find(h => h.id === hiveId);
+    
+    if (!hive) {
+      return res.status(404).json({ success: false, error: 'Hive not found' });
+    }
+    
+    res.json({
+      success: true,
+      hiveId: hive.id,
+      status: hive.status,
+      isAvailable: hive.status !== 'sold',
+      owner: hive.owner || null,
+      serialNumber: hive.serialNumber || null
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
 
-app.listen(PORT, () => {
-  console.log(`SERVER running on port ${PORT}`);
+// ✅ USE PORT FROM ENVIRONMENT (Required for deployment)
+const PORT = process.env.PORT || 3001;
+
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`✓ API running on port ${PORT}`);
+  console.log(`✓ Environment: ${process.env.NODE_ENV || 'development'}`);
 });
