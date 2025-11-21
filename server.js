@@ -26,7 +26,7 @@ const app = express();
 const allowedOrigins = [
   'http://localhost:5173',
   'http://localhost:3000',
-  process.env.FRONTEND_URL || 'https://your-frontend.onrender.com'
+  process.env.FRONTEND_URL || 'https://ecolivefrontendv2.vercel.app',
 ];
 
 app.use(cors({
