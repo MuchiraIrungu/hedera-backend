@@ -209,7 +209,8 @@ app.post('/api/buy-hive', async (req, res) => {
 
     // Upload to IPFS
     const ipfsUrl = await uploadToPinata(metadata);
-    const metadataBytes = Buffer.from(ipfsUrl);
+    //console.log("Uploaded to IPFS:", ipfsUrl);
+    const metadataBytes = new TextEncoder().encode(ipfsUrl);
 
     if (metadataBytes.length > 100) {
       throw new Error("Metadata too big (max 100 bytes)");
